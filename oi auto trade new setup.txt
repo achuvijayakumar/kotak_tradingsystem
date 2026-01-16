@@ -1,0 +1,245 @@
+OI AUTO – FINAL DESIGN PLAN (MINIMAL, DETERMINISTIC)
+Core Philosophy
+
+Only ONE live position per index (NIFTY / BANKNIFTY)
+
+System is position-aware, not just signal-aware
+
+Exit always happens before entry
+
+Overnight risk is never naked
+
+Everything is auditable and restart-safe
+
+1. State Ownership (very important)
+A. Transient (Redis)
+
+Used only for:
+
+Signals (NIFTY_OI_SIGNAL)
+
+Execution flags (PLACE_*)
+
+Engine status / UI
+
+In-flight orders
+
+Redis is not trusted for strategy memory.
+
+B. Persistent (Files – source of truth)
+
+We introduce two small JSON files:
+
+1️⃣ oi_live_positions.json
+
+Truth of what the strategy currently holds
+
+{
+  "NIFTY": {
+    "direction": "BEARISH",
+    "opened_at": "2026-01-07T11:42:10",
+    "naked": true,
+    "hedged": false,
+    "legs": [
+      {
+        "Index": "NIFTY",
+        "Side": "SELL",
+        "Strike": 26000,
+        "OptionType": "CE",
+        "Qty": 65,
+        "Expiry": "2026-01-27",
+        "order_id": "123456"
+      }
+    ]
+  }
+}
+
+
+Exists → strategy is in position
+
+Removed → strategy is flat
+
+2️⃣ oi_last_pece_sign.json
+
+Market bias continuity across restarts / days
+
+{
+  "NIFTY": -1,
+  "BANKNIFTY": 1
+}
+
+
+Updated continuously by the signal engine.
+
+2. Signal Generation (OI Signal Engine)
+What stays the same
+
+PE-CE calculation
+
+Threshold filtering
+
+Sign detection
+
+Redis signal publishing
+
+What is added (bootstrap rule)
+Morning / Restart Bootstrap Rule
+
+If:
+
+No live position exists
+
+No crossover occurred yet
+
+PE-CE magnitude ≥ threshold
+
+Then:
+
+Treat current sign as a valid entry
+
+Generate signal = BULLISH / BEARISH
+
+Mark BOOTSTRAP_DONE for the day
+
+This fixes:
+
+“Yesterday BEARISH → today BEARISH → no trade”
+
+Bootstrap fires:
+
+Once per day
+
+Only when flat
+
+3. Entry Logic (OI Auto Order Engine)
+
+Triggered by:
+
+Crossover signal
+
+OR bootstrap signal
+
+Before doing anything:
+
+Load oi_live_positions.json
+
+4. Exit-First Rule (absolute)
+If a live position exists:
+Case A: Same direction signal
+
+Do nothing
+
+Consume signal
+
+Avoid re-entry / stacking
+
+Case B: Opposite direction signal
+
+EXIT existing position
+
+Build reverse legs
+
+Use MULTI_LEGS
+
+Only if exit succeeds
+
+Remove position from file
+
+Proceed to entry
+
+❗ If exit fails → STOP. No new SELL.
+
+This rule applies:
+
+Same day
+
+Next day
+
+Any time
+
+5. Entry (SELL logic)
+
+When allowed to enter:
+
+Place naked SELL (same as today)
+
+On success:
+
+Write new entry into oi_live_positions.json
+
+Mark naked = true
+
+Nothing else changes.
+
+6. 15:20 Hedge Engine (new, separate)
+Purpose
+
+Ensure no naked overnight risk
+
+Runs as a separate loop
+
+At or after 15:20:
+
+Load oi_live_positions.json
+
+For each position:
+
+If naked == true
+
+Build hedge leg(s)
+
+Place MULTI_LEGS order
+
+On success:
+
+Update position:
+
+"naked": false,
+"hedged": true
+
+
+Hedge logic is:
+
+Deterministic
+
+Fixed width (e.g. 200 pts)
+
+No smart adjustments
+
+7. Next Day Behavior
+Scenario 1: No signal change
+
+Position remains (hedged)
+
+No new trades
+
+Scenario 2: Opposite crossover happens
+
+Exit entire structure (naked or hedged)
+
+Then SELL new side
+
+Update live position file
+
+8. What this system guarantees
+
+✔ Never more than one position per index
+✔ No overnight naked exposure
+✔ No reliance on Redis persistence
+✔ Restart-safe
+✔ Deterministic behavior
+✔ Clean audit trail
+
+9. What we intentionally did NOT add
+
+❌ No MTM logic
+
+❌ No Greeks
+
+❌ No trailing hedge
+
+❌ No UI complexity
+
+❌ No signal engine rewrite
+
+This keeps the system stable and debuggable.

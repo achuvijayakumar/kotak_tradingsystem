@@ -1,0 +1,10 @@
+import duckdb
+
+con = duckdb.connect("md:?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImFjaHV2aWpheWFrdW1hcjk4QGdtYWlsLmNvbSIsIm1kUmVnaW9uIjoiYXdzLWV1LWNlbnRyYWwtMSIsInNlc3Npb24iOiJhY2h1dmlqYXlha3VtYXI5OC5nbWFpbC5jb20iLCJwYXQiOiJRM0NjaHVPa0o4RHNMdWRMM3Q5UWNMVjFPVm5CZ2V0cmxOMTFSNFE2OEdJIiwidXNlcklkIjoiNjRhODM3MzMtM2M1OC00MTcyLTkyM2UtNDZmNjNjODQ1NmMyIiwiaXNzIjoibWRfcGF0IiwicmVhZE9ubHkiOmZhbHNlLCJ0b2tlblR5cGUiOiJyZWFkX3dyaXRlIiwiaWF0IjoxNzY0MjM4NzA5fQ.QgX5-G1F8kKipmk9PZHoEeqxiLcpU3bIclmqTkzX9C4")
+
+con.execute("""
+    CREATE SCHEMA IF NOT EXISTS trading;
+""")
+
+print("Orderbook table updated.")
+

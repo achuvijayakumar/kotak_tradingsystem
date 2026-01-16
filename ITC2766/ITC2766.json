@@ -1,0 +1,9 @@
+{
+  "INTERACTIVE_API_KEY": "f3fef311f747ecdb550859",
+  "INTERACTIVE_API_SECRET": "Wnlv473@R#",
+  "INTERACTIVE_XTS_API_BASE_URL": "https://jtrade.jainam.in:5000/#!/app",
+
+  "MARKETDATA_API_KEY": "fba52077b48dccef6e6375",
+  "MARKETDATA_API_SECRET": "Umla410@YF",
+  "MARKETDATA_XTS_API_BASE_URL": "https://jtrade.jainam.in:5000/#!/app"
+}
