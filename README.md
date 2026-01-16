@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Poozhi Trading System
 
 A custom trading interface built with Streamlit and Python, interacting with the XTS API via a Redis-based agent.
@@ -45,3 +46,6 @@ A custom trading interface built with Streamlit and Python, interacting with the
 -   `impl.py`: The backend agent logic.
 -   `master.py`: Script to initialize instrument data.
 -   `agent.md`: Documentation of the agent's architecture.
+=======
+# kotak_tradingsystem
+>>>>>>> 9a31ed3bbeebb369b1c62f56b4ea6c04f72b8776
