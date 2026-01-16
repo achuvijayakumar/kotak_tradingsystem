@@ -1,12 +1,28 @@
-"""Configuration management for the trading application."""
+"""
+Configuration management for Kotak Neo trading application.
+
+Loads Neo API credentials from JSON config files.
+"""
 import json
 import os
 import sys
 import logging
 
 
-def load_config(uid):
-    """Load configuration from JSON file for the given UID.
+def load_config(uid: str) -> dict:
+    """
+    Load configuration from JSON file for the given UID.
+    
+    Expected config file: {base_dir}/{uid}/{uid}.json
+    
+    Required fields for Neo API:
+        - consumer_key: Kotak Neo API consumer key
+        - mobile_number: Registered mobile with country code (+91...)
+        - ucc: Unique Client Code
+        - mpin: MPIN for account
+    
+    Optional fields:
+        - totp: Time-based OTP (usually passed at runtime)
     
     Args:
         uid: User ID
@@ -18,8 +34,7 @@ def load_config(uid):
         SystemExit: If config file not found or invalid
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    # Go up one level from core/ to poozhi/
-    base_dir = os.path.dirname(base_dir)
+    base_dir = os.path.dirname(base_dir)  # Go up from core/
     config_file = os.path.join(base_dir, uid, f"{uid}.json")
     
     try:
@@ -32,67 +47,20 @@ def load_config(uid):
         logging.error(f"[ERROR] Invalid JSON format in '{config_file}'")
         sys.exit(1)
     
-    # Validate required fields
-    required_fields = ["INTERACTIVE_API_KEY", "INTERACTIVE_API_SECRET", "INTERACTIVE_XTS_API_BASE_URL"]
-    if not all(creds.get(field) for field in required_fields):
-        logging.error("[ERROR] Missing one or more required credentials in config file.")
+    # Validate required fields for Neo API
+    required_fields = ["consumer_key", "mobile_number", "ucc", "mpin"]
+    missing = [f for f in required_fields if not creds.get(f)]
+    
+    if missing:
+        logging.error(f"[ERROR] Missing required fields in config: {missing}")
         sys.exit(1)
     
     return creds
 
 
-def load_token(uid):
-    """Load authentication token from file.
-    
-    Args:
-        uid: User ID
-        
-    Returns:
-        str: Authentication token
-        
-    Raises:
-        SystemExit: If token file not found or invalid
+def get_file_paths(uid: str) -> dict:
     """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    base_dir = os.path.dirname(base_dir)
-    token_file = os.path.join(base_dir, uid, "token.txt")
-    
-    try:
-        with open(token_file, "r") as f:
-            token = f.read().strip()
-            logging.info(f"Token read successfully for {uid}")
-    except FileNotFoundError:
-        logging.error(f"[ERROR] Token file not found for {uid}")
-        sys.exit(1)
-    except Exception as e:
-        logging.error(f"[ERROR] Could not read token: {e}")
-        sys.exit(1)
-    
-    if len(token) < 25:
-        logging.error("Invalid Token")
-        sys.exit(1)
-    
-    return token
-
-
-def save_token(uid, token):
-    """Save authentication token to file.
-    
-    Args:
-        uid: User ID
-        token: Authentication token to save
-    """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    base_dir = os.path.dirname(base_dir)
-    token_file = os.path.join(base_dir, uid, "token.txt")
-    
-    with open(token_file, "w") as f:
-        f.write(token)
-    logging.info(f"[SUCCESS] Token stored at: {token_file}")
-
-
-def get_file_paths(uid):
-    """Get file paths for positions, balance, and orderbook.
+    Get file paths for positions, balance, and orderbook CSV files.
     
     Args:
         uid: User ID
@@ -109,3 +77,12 @@ def get_file_paths(uid):
         'orderbook': os.path.join(base_dir, uid, "orderbook.csv"),
         'base_dir': base_dir
     }
+
+
+# Example config file format:
+# {
+#     "consumer_key": "your_kotak_neo_consumer_key",
+#     "mobile_number": "+91XXXXXXXXXX",
+#     "ucc": "YOUR_UCC_CODE",
+#     "mpin": "1234"
+# }

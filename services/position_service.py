@@ -7,16 +7,17 @@ import pandas as pd
 class PositionService:
     """Handles position fetching and saving."""
     
-    def __init__(self, xt, redis_client, uid, position_file):
+    def __init__(self, client, redis_client, uid, position_file):
         """Initialize position service.
         
         Args:
-            xt: XTS client instance
+            client: NeoAPI client instance (authenticated)
             redis_client: Redis client instance
             uid: User ID
             position_file: Path to position CSV file
         """
-        self.xt = xt
+        # XTS → KOTAK NEO REPLACEMENT: renamed xt to client
+        self.client = client
         self.redis_client = redis_client
         self.uid = uid
         self.position_file = position_file
@@ -36,13 +37,22 @@ class PositionService:
         self._fetch_and_save_positions()
     
     def _fetch_and_save_positions(self):
-        """Fetch positions from XTS API and save to CSV."""
+        """Fetch positions from Neo API and save to CSV."""
+        # SAFETY CHECK: Ensure client is authenticated
+        if self.client is None:
+            logging.error("[FATAL] NeoAPI client is None - cannot fetch positions")
+            return
 
         # 🔴 Clear old positions immediately
         pd.DataFrame().to_csv(self.position_file, index=False)
 
-        response = self.xt.get_position_netwise(clientID=self.uid)
-        logging.info(f"Position by Net: {response}")
+        # XTS → KOTAK NEO REPLACEMENT: xt.get_position_netwise() → client.positions()
+        try:
+            response = self.client.positions()
+            logging.info(f"Position response: {json.dumps(response) if isinstance(response, dict) else response}")
+        except Exception as e:
+            logging.error(f"[POSITIONS ERROR] Failed to fetch positions: {e}", exc_info=True)
+            return
         
         resp = response
         
@@ -50,16 +60,21 @@ class PositionService:
         if isinstance(resp, (str, bytes, bytearray)):
             resp = json.loads(resp)
         
-        if resp.get("type") == "success" and "result" in resp:
-            positions = resp["result"].get("positionList", [])
+        # XTS → KOTAK NEO REPLACEMENT: Neo returns different structure
+        # Neo response: {"stat": "Ok", "stCode": 200, "data": [...]}
+        if resp and resp.get("stat") == "Ok" and "data" in resp:
+            positions = resp.get("data", [])
             df = pd.DataFrame(positions)
 
             # 🔴 MINIMAL FIX: remove exited positions
-            if not df.empty and "Quantity" in df.columns:
+            # XTS → KOTAK NEO REPLACEMENT: Neo uses "flQty" for quantity
+            if not df.empty and "flQty" in df.columns:
+                df = df[df["flQty"].astype(int) != 0]
+            elif not df.empty and "Quantity" in df.columns:
                 df = df[df["Quantity"] != 0]
 
             # Save DataFrame to CSV
             df.to_csv(self.position_file, index=False)
             logging.info("Position Request successful")
         else:
-            logging.warning("Position Request not successful")
+            logging.warning(f"Position Request not successful: {resp}")

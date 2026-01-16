@@ -1,8 +1,8 @@
 import telebot
 import logging
 
-BOT_TOKEN = "8552224849:AAGFlic94zpSKWaMC_xQPuCE3SVKm78GY1o"
-GROUP_ID = -1003406987409  # your group ID
+BOT_TOKEN = "8393149048:AAFlQc9jqwyUn18lOEe9zERFQXe3wbnad2g"
+GROUP_ID = -1005109977089  # your group ID
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -14,4 +14,4 @@ def send_telegram(msg: str, chat_id: int = GROUP_ID):
     except Exception as e:
         logging.error(f"Telegram send failed: {e}")
         return False
-#send_telegram("Testing Telegram Notification", chat_id="-1003406987409")
+send_telegram("Testing Telegram Notification", chat_id="-1005109977089")

@@ -1,204 +1,282 @@
-import json
+"""
+Neo Instrument Builder - Downloads and stores instrument master in Redis.
+
+Purpose:
+- Fetches scrip master from Kotak Neo API (nse_fo segment)
+- Filters NIFTY and BANKNIFTY options only
+- Normalizes Redis keys as: INDEX_YYYY-MM-DD_CE/PE_STRIKE
+- Stores mappings in Redis hash NEO_INSTR_OPT
+- Idempotent: safe to re-run (overwrites existing keys)
+
+Usage:
+    python instruments.py [uid]
+    
+    If uid is provided, uses config from {uid}/{uid}.json
+    Otherwise uses environment variable NEO_CONSUMER_KEY
+
+Verification:
+    redis-cli HGET NEO_INSTR_OPT NIFTY_2026-01-27_CE_26000
+"""
+
+import redis
+import re
 import sys
 import os
-from XTSConnect import XTSConnect  # ensure the module is available
-
-# --- Step 1: Ensure UID argument is passed ---
-if len(sys.argv) < 2:
-    print("[ERROR] UID argument missing.")
-    sys.exit(1)
-
-uid = sys.argv[1]  # example: 'achu'
-
-# --- Step 2: Locate the JSON file inside 'uid' folder (relative to this script) ---
-base_dir = os.path.dirname(os.path.abspath(__file__))
-uid_dir = os.path.join(base_dir, uid)
-config_file = os.path.join(base_dir, uid, f"{uid}.json")
-
-# --- Step 3: Read credentials from JSON file ---
-try:
-    with open(config_file, "r") as file:
-        creds = json.load(file)
-except FileNotFoundError:
-    print(f"[ERROR] Config file not found: {config_file}")
-    sys.exit(1)
-except json.JSONDecodeError:
-    print(f"[ERROR] Invalid JSON format in '{config_file}'")
-    sys.exit(1)
-
-# --- Step 4: Extract credentials ---
-MARKETDATA_API_KEY = creds.get("MARKETDATA_API_KEY")
-MARKETDATA_API_SECRET = creds.get("MARKETDATA_API_SECRET")
-MARKETDATA_XTS_API_BASE_URL = creds.get("MARKETDATA_XTS_API_BASE_URL")
-
-# --- Step 5: Validate required fields ---
-if not all([MARKETDATA_API_KEY, MARKETDATA_API_SECRET, MARKETDATA_XTS_API_BASE_URL]):
-    print("[ERROR] Missing one or more required credentials in config file.")
-    sys.exit(1)
-
-# --- Step 6: Initialize XTSConnect ---
-print(f"[INFO] Logging in using credentials from {config_file} ...")
-
-xt = XTSConnect(
-    MARKETDATA_API_KEY,
-    MARKETDATA_API_SECRET,
-    "WEBAPI",
-    MARKETDATA_XTS_API_BASE_URL
-)
-
-print("[SUCCESS] XTSConnect initialized successfully.")
-
-# --- Step 7: Attempt login and print response ---
-try:
-    resp = xt.marketdata_login()
-    print("login response =", resp)
-except Exception as e:
-    print("[ERROR] Login failed:", e)
-    sys.exit(1)
-
-# --- Step 8: Extract token from response ---
-token = resp
-
-# --- Step 9: Validate and store token ---
-if token and len(token) > 25:  # your length check still works
-    token_file = os.path.join(uid_dir, "token.txt")
-    with open(token_file, "w") as f:
-        f.write(token)
-    print(f"[SUCCESS] Token stored at: {token_file}")
-else:
-    print("[ERROR] Invalid credentials or token too short. Token not saved.")
-
-
-
-"""Get Master Instruments Request"""
-exchangesegments = [xt.EXCHANGE_NSEFO, xt.EXCHANGE_NSECM]
-response = xt.get_master(exchangeSegmentList=exchangesegments)
-#print("Master: " + str(response))
-# response= xt.get_option_symbol(xt.EXCHANGE_NSEFO, series, symbol, expiryDate, optionType, strikePrice)
-# print(response)
-
-import pandas as pd
-
-raw = response["result"]  # your string from API
-
-# Split rows
-rows = raw.strip().split("\n")
-# Split fields by '|'
-data = [row.split("|") for row in rows]
-
-# Header provided by you
-header = [
-    "ExchangeSegment","ExchangeInstrumentID","InstrumentType","Name","Description","Series",
-    "NameWithSeries","InstrumentID","PriceBandHigh","PriceBandLow","FreezeQty","TickSize",
-    "LotSize","Multiplier","UnderlyingInstrumentId","UnderlyingIndexName","ContractExpiration",
-    "StrikePrice","OptionType","DisplayName","PriceNumerator", "Dummy1","Dummy2"
-]
-
-# Create DataFrame
-df = pd.DataFrame(data, columns = header)
-
-# Save CSV
-#df.to_csv("instrument_data.csv", index=False)
-df[["ExchangeInstrumentID", "DisplayName"]].to_csv(
-    "instrument_data.csv",
-    index=False
-)
-
-print(df)
-print("\nSaved to instrument_data.csv")
-
-
-import pandas as pd
-
-# Read only required columns
-df = pd.read_csv("instrument_data.csv", usecols=["ExchangeInstrumentID", "DisplayName"])
-
-# Filter using .str.startswith()
-filtered = df[
-    df["DisplayName"].str.startswith(("NIFTY ", "BANKNIFTY"), na=False)
-]
-
-filtered.to_csv("instr.csv", index=False)
-
-import pandas as pd
+import json
 from datetime import datetime
-import redis
+from typing import Optional, Dict, Tuple
+import logging
 
-# Redis connection
-redis_client = redis.StrictRedis(host="localhost", port=6379, db=0)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# -------- Read CSV --------
-df = pd.read_csv("instr.csv", usecols=["ExchangeInstrumentID", "DisplayName"])
+# Redis configuration
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
+REDIS_DB = 0
 
+# Redis hash keys
+REDIS_KEY_OPT = "NEO_INSTR_OPT"
+REDIS_KEY_EQ = "NEO_INSTR_EQ"
 
-# -------- Transform function --------
-def transform_display_name(name: str) -> str:
-    # expected format: "NIFTY 23DEC2025 CE 31250"
-    parts = name.split()
-    if len(parts) != 4:
-        return name  # fallback for unexpected cases
+# Supported indices
+SUPPORTED_INDICES = {"NIFTY", "BANKNIFTY"}
 
-    index, date_raw, opt_type, strike = parts
-    parsed_date = datetime.strptime(date_raw, "%d%b%Y").strftime("%Y-%m-%d")
-
-    return f"{index}_{parsed_date}_{opt_type}_{strike}"
-
-
-# Apply transformation
-df["transformed"] = df["DisplayName"].apply(transform_display_name)
-
-
-# -------- Clear existing Redis hash --------
-redis_client.delete("XTS_INSTR")
-
-
-# -------- Store transformed -> instrumentID --------
-mapping = {
-    row["transformed"]: str(row["ExchangeInstrumentID"])
-    for _, row in df.iterrows()
+# Month name to number mapping
+MONTH_MAP = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"
 }
 
-redis_client.hset("XTS_INSTR", mapping=mapping)
 
-print("Stored in Redis XTS_INSTR:")
-for k, v in mapping.items():
-    print(k, "=>", v)
+def parse_display_name(display_name: str) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Parse DisplayName from scrip master.
+    
+    Input format examples:
+        "NIFTY 27JAN2026 CE 26000"
+        "BANKNIFTY 24FEB2026 PE 69100"
+    
+    Returns:
+        Tuple of (index, date_iso, option_type, strike) or None if parsing fails
+    """
+    pattern = r'^(NIFTY|BANKNIFTY)\s+(\d{2})([A-Z]{3})(\d{4})\s+(CE|PE)\s+(\d+)$'
+    match = re.match(pattern, display_name.strip())
+    
+    if not match:
+        return None
+    
+    index = match.group(1)
+    day = match.group(2)
+    month_str = match.group(3)
+    year = match.group(4)
+    option_type = match.group(5)
+    strike = match.group(6)
+    
+    month = MONTH_MAP.get(month_str.upper())
+    if not month:
+        return None
+    
+    date_iso = f"{year}-{month}-{day}"
+    
+    try:
+        datetime.strptime(date_iso, "%Y-%m-%d")
+    except ValueError:
+        return None
+    
+    return (index, date_iso, option_type, strike)
 
-# -------------------------------------------------------------------
-# NEW: Process NSECM (Equity) Instruments
-# -------------------------------------------------------------------
 
-# Re-create DataFrame from the original 'data' list which contains BOTH NSEFO and NSECM
-df_all = pd.DataFrame(data, columns=header)
+def build_redis_key(index: str, date_iso: str, option_type: str, strike: str) -> str:
+    """Build normalized Redis key: INDEX_YYYY-MM-DD_CE/PE_STRIKE"""
+    return f"{index}_{date_iso}_{option_type}_{strike}"
 
-# Filter for NSECM and Series EQ
-# ExchangeSegment: "NSECM" usually corresponds to ID 1 (based on XTS SDK), but let's check explicit field if available.
-# Actually, 'ExchangeSegment' is the first column. "NSEFO" is usually 2, "NSECM" is 1.
-# Or we can just use Series='EQ' which is specific to Equity.
 
-df_equity = df_all[
-    (df_all["Series"] == "EQ")
-].copy()
+def load_scrip_master_from_csv(csv_path: str) -> Dict[str, str]:
+    """Load scrip master from local CSV file."""
+    instruments = {}
+    
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        header = f.readline().strip()
+        logger.info(f"CSV Header: {header}")
+        
+        line_count = 0
+        parsed_count = 0
+        
+        for line in f:
+            line_count += 1
+            line = line.strip()
+            if not line:
+                continue
+            
+            parts = line.split(',', 1)
+            if len(parts) != 2:
+                continue
+            
+            instrument_id = parts[0].strip()
+            display_name = parts[1].strip()
+            
+            parsed = parse_display_name(display_name)
+            if parsed is None:
+                continue
+            
+            index, date_iso, option_type, strike = parsed
+            
+            if index not in SUPPORTED_INDICES:
+                continue
+            
+            redis_key = build_redis_key(index, date_iso, option_type, strike)
+            instruments[redis_key] = instrument_id
+            parsed_count += 1
+        
+        logger.info(f"Processed {line_count} lines, parsed {parsed_count} NIFTY/BANKNIFTY options")
+    
+    return instruments
 
-# Select columns
-# Name -> Symbol (e.g. RELIANCE)
-# ExchangeInstrumentID -> ID
 
-# Prepare mapping: SYMBOL -> ExchangeInstrumentID
-equity_mapping = {
-    row["Name"]: str(row["ExchangeInstrumentID"]) 
-    for _, row in df_equity.iterrows()
-}
+def load_scrip_master_from_api(consumer_key: str) -> Dict[str, str]:
+    """Load scrip master from Kotak Neo API."""
+    try:
+        from neo_api_client import NeoAPI
+        
+        client = NeoAPI(
+            environment='prod',
+            access_token=None,
+            neo_fin_key=None,
+            consumer_key=consumer_key
+        )
+        
+        logger.info("Fetching scrip master from Kotak Neo API...")
+        response = client.scrip_master(exchange_segment="nse_fo")
+        
+        if not response:
+            logger.warning("Empty response from scrip_master API")
+            return {}
+        
+        instruments = {}
+        
+        for scrip in response:
+            display_name = scrip.get('pSymbolName', '') or scrip.get('sSymbol', '')
+            instrument_id = str(scrip.get('nToken', '')) or scrip.get('pExchSeg', '')
+            trading_symbol = scrip.get('pTrdSymbol', '')
+            
+            parsed = parse_display_name(display_name)
+            if parsed is None:
+                continue
+            
+            index, date_iso, option_type, strike = parsed
+            
+            if index not in SUPPORTED_INDICES:
+                continue
+            
+            redis_key = build_redis_key(index, date_iso, option_type, strike)
+            value = trading_symbol if trading_symbol else instrument_id
+            instruments[redis_key] = value
+        
+        logger.info(f"Fetched {len(instruments)} instruments from API")
+        return instruments
+        
+    except ImportError:
+        logger.warning("neo_api_client not installed")
+        return {}
+    except Exception as e:
+        logger.error(f"Error fetching from API: {e}")
+        return {}
 
-# Store in separate Redis key
-redis_client.delete("XTS_INSTR_EQ")
-if equity_mapping:
-    redis_client.hset("XTS_INSTR_EQ", mapping=equity_mapping)
-    print("\n[SUCCESS] Stored NSECM (EQ) keys in Redis XTS_INSTR_EQ")
-    # print first 5 items
-    from itertools import islice
-    for k, v in islice(equity_mapping.items(), 5):
-        print(f"  {k} -> {v}")
-else:
-    print("\n[WARNING] No NSECM (EQ) instruments found.")
 
+def populate_redis(instruments: Dict[str, str], redis_key: str = REDIS_KEY_OPT) -> int:
+    """Populate Redis hash with instrument mappings."""
+    if not instruments:
+        logger.warning("No instruments to populate")
+        return 0
+    
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+    
+    try:
+        r.ping()
+        logger.info(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+    except redis.ConnectionError as e:
+        logger.error(f"Failed to connect to Redis: {e}")
+        raise
+    
+    existing_count = r.hlen(redis_key)
+    if existing_count > 0:
+        logger.info(f"Clearing existing {existing_count} keys from {redis_key}")
+        r.delete(redis_key)
+    
+    logger.info(f"Populating {len(instruments)} instruments to {redis_key}...")
+    r.hset(redis_key, mapping=instruments)
+    
+    final_count = r.hlen(redis_key)
+    logger.info(f"Successfully populated {final_count} instruments")
+    
+    return final_count
+
+
+def main():
+    """Main entry point."""
+    logger.info("=" * 60)
+    logger.info("Neo Instrument Builder - Starting")
+    logger.info("=" * 60)
+    
+    # Get consumer key from config or environment
+    consumer_key = None
+    
+    if len(sys.argv) >= 2:
+        uid = sys.argv[1]
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        config_file = os.path.join(base_dir, uid, f"{uid}.json")
+        
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+                consumer_key = config.get('consumer_key')
+                logger.info(f"Loaded config from {config_file}")
+    
+    if not consumer_key:
+        consumer_key = os.environ.get("NEO_CONSUMER_KEY")
+    
+    instruments = {}
+    
+    # Try API first
+    if consumer_key:
+        instruments = load_scrip_master_from_api(consumer_key)
+    
+    # Fall back to CSV
+    if not instruments:
+        csv_path = os.path.join(os.path.dirname(__file__), "instr.csv")
+        if os.path.exists(csv_path):
+            logger.info(f"Loading from CSV: {csv_path}")
+            instruments = load_scrip_master_from_csv(csv_path)
+        else:
+            logger.error(f"CSV file not found: {csv_path}")
+            return
+    
+    if not instruments:
+        logger.error("No instruments loaded - aborting")
+        return
+    
+    # Populate Redis
+    count = populate_redis(instruments)
+    
+    if count > 0:
+        sample_keys = list(instruments.keys())[:3]
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+        
+        logger.info("\n=== Sample Verification ===")
+        for key in sample_keys:
+            value = r.hget(REDIS_KEY_OPT, key)
+            logger.info(f"  {key} = {value}")
+    
+    logger.info("\n" + "=" * 60)
+    logger.info("Neo Instrument Builder - Complete")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

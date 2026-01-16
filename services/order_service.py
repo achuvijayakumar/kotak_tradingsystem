@@ -13,17 +13,18 @@ from utils.oi_positions import (
 
 
 class OrderService:
-    """Handles all order placement operations."""
+    """Handles all order placement operations using Kotak Neo API."""
     
-    def __init__(self, xt, redis_client, uid):
+    def __init__(self, client, redis_client, uid):
         """Initialize order service.
         
         Args:
-            xt: XTS client instance
+            client: NeoAPI client instance (authenticated)
             redis_client: Redis client instance
             uid: User ID
         """
-        self.xt = xt
+        # XTS → KOTAK NEO REPLACEMENT: renamed xt to client
+        self.client = client
         self.redis_client = redis_client
         self.uid = uid
     
@@ -31,94 +32,126 @@ class OrderService:
         """Place one option leg with independent parameters.
         
         Args:
-            leg: Dictionary containing leg parameters (Strike, Qty, Side, OptionType, Expiry, exchangeInstrumentID)
+            leg: Dictionary containing leg parameters (Strike, Qty, Side, OptionType, Expiry, tradingSymbol)
             
         Returns:
-            dict: Response from XTS API
+            dict: Response from Neo API
         """
+        # SAFETY CHECK: Ensure client is authenticated
+        if self.client is None:
+            logging.error("[FATAL] NeoAPI client is None - not authenticated")
+            return {"type": "error", "description": "Client not authenticated"}
+        
         strike = leg["Strike"]
         qty = int(leg["Qty"])
 
         exec_type = leg.get("ExecutionType", "MARKET")
+        # XTS → KOTAK NEO REPLACEMENT: Neo uses "L" for LIMIT, "MKT" for MARKET
         if exec_type == "LIMIT":
-            order_type = self.xt.ORDER_TYPE_LIMIT
-            limit_price = float(leg.get("LimitPrice", 0))
+            order_type = "L"
+            limit_price = str(leg.get("LimitPrice", 0))
         else:
-            order_type = self.xt.ORDER_TYPE_MARKET
-            limit_price = 0
+            order_type = "MKT"
+            limit_price = "0"
 
         side = leg["Side"].upper()  # BUY / SELL
         opt = leg["OptionType"].upper()  # CE / PE
         expiry_raw = leg["Expiry"]  # YYYY-MM-DD
-        expiry = expiry_raw  # YYYYMMDD
         
-        # Exchange Instrument ID is now passed from UI
-        exchange_inst_id = leg.get("exchangeInstrumentID")
+        # XTS → KOTAK NEO REPLACEMENT: Use tradingSymbol instead of exchangeInstrumentID
+        trading_symbol = leg.get("tradingSymbol")
         
-        if not exchange_inst_id:
-            logging.error(f"[ERROR] Missing exchangeInstrumentID for leg: {leg}")
-            return {"type": "error", "description": "Missing exchangeInstrumentID"}
+        if not trading_symbol:
+            # Fallback: Build from Redis lookup (NEO_INSTR_OPT)
+            # XTS → KOTAK NEO REPLACEMENT: Using NEO_INSTR_OPT instead of XTS_INSTR
+            redis_key = f"{leg['Index']}_{expiry_raw}_{opt}_{strike}"
+            trading_symbol = self.redis_client.hget("NEO_INSTR_OPT", redis_key)
+            
+        if not trading_symbol:
+            logging.error(f"[ERROR] Missing tradingSymbol for leg: {leg}")
+            return {"type": "error", "description": "Missing tradingSymbol"}
         
-        logging.info(f"Using ExchangeInstrumentID = {exchange_inst_id}")
-        logging.info(f"[EXEC] {side} {opt} {strike} {expiry} Qty={qty}")
+        logging.info(f"Using tradingSymbol = {trading_symbol}")
+        logging.info(f"[EXEC] {side} {opt} {strike} {expiry_raw} Qty={qty}")
         
-        # XTS Place Order Call
+        # XTS → KOTAK NEO REPLACEMENT: Neo place_order call
         try:
-            response = self.xt.place_order(
-                exchangeSegment=self.xt.EXCHANGE_NSEFO,
-                exchangeInstrumentID=exchange_inst_id,
-                productType=self.xt.PRODUCT_NRML,
-                orderType=order_type,
-                orderSide=self.xt.TRANSACTION_TYPE_BUY if side == "BUY" else self.xt.TRANSACTION_TYPE_SELL,
-                timeInForce=self.xt.VALIDITY_DAY,
-                disclosedQuantity=0,
-                orderQuantity=qty,
-                limitPrice=limit_price,
-                stopPrice=0,
-                orderUniqueIdentifier=f"LEG-{int(time.time()*1000)}",
-                clientID=self.uid
+            logging.info(f"[ORDER] Placing: symbol={trading_symbol}, side={side}, qty={qty}, type={order_type}")
+            
+            response = self.client.place_order(
+                exchange_segment="nse_fo",
+                product="NRML",
+                price=limit_price,
+                order_type=order_type,
+                quantity=str(qty),
+                validity="DAY",
+                trading_symbol=trading_symbol,
+                transaction_type="B" if side == "BUY" else "S",
+                amo="NO",
+                disclosed_quantity="0",
+                market_protection="0",
+                pf="N",
+                trigger_price="0",
+                tag=f"LEG-{int(time.time()*1000)}"
             )
-            logging.info(f"[XTS Response] {response}")
-            return response
+            
+            # DEFENSIVE: Log full response for debugging
+            logging.info(f"[Neo Response] {json.dumps(response) if isinstance(response, dict) else response}")
+            
+            # SAFETY CHECK: Handle None response
+            if response is None:
+                logging.error("[ERROR] Neo API returned None response")
+                return {"type": "error", "description": "Neo API returned empty response"}
+            
+            # SAFETY CHECK: Handle error responses
+            if response.get("Error") or response.get("stat") == "Not_Ok":
+                error_msg = response.get("Error Message") or response.get("message") or response.get("emsg") or str(response)
+                logging.error(f"[ORDER REJECTED] {error_msg}")
+                return {"type": "error", "description": error_msg}
+            
+            # Success path
+            order_no = response.get("nOrdNo", "Unknown")
+            logging.info(f"[ORDER SUCCESS] Order placed: {order_no}")
+            return {"type": "success", "result": response}
+                
         except Exception as e:
-            logging.error(f"[ERROR] Failed to place order: {e}")
+            logging.error(f"[ORDER EXCEPTION] Failed to place order: {e}", exc_info=True)
             return {"type": "error", "description": str(e)}
 
     def _execute_squareoff_leg(self, leg):
         try:
-            exch_id = int(leg["exchangeInstrumentID"])
+            trading_symbol = leg.get("tradingSymbol") or leg.get("TradingSymbol")
             qty = int(leg["Quantity"])
             side = leg["Side"]
 
             logging.info(
-                f"[SQUAREOFF] {side} {qty} {leg.get('TradingSymbol', '')}"
+                f"[SQUAREOFF] {side} {qty} {trading_symbol}"
             )
 
-            self.xt.place_order(
-                exchangeSegment=self.xt.EXCHANGE_NSEFO,
-                exchangeInstrumentID=exch_id,
-                productType=self.xt.PRODUCT_NRML,
-                orderType=self.xt.ORDER_TYPE_MARKET,
-                orderSide=(
-                    self.xt.TRANSACTION_TYPE_BUY
-                    if side == "BUY"
-                    else self.xt.TRANSACTION_TYPE_SELL
-                ),
-                timeInForce=self.xt.VALIDITY_DAY,
-                disclosedQuantity=0,
-                orderQuantity=qty,
-                limitPrice=0,
-                stopPrice=0,
-                orderUniqueIdentifier=f"SQOFF-{int(time.time()*1000)}",
-                clientID=self.uid
+            # XTS → KOTAK NEO REPLACEMENT: Neo place_order for squareoff
+            self.client.place_order(
+                exchange_segment="nse_fo",
+                product="NRML",
+                price="0",
+                order_type="MKT",
+                quantity=str(qty),
+                validity="DAY",
+                trading_symbol=trading_symbol,
+                transaction_type="B" if side == "BUY" else "S",
+                amo="NO",
+                disclosed_quantity="0",
+                market_protection="0",
+                pf="N",
+                trigger_price="0",
+                tag=f"SQOFF-{int(time.time()*1000)}"
             )
 
-            logging.info(f"[SQUAREOFF] SUCCESS {exch_id}")
+            logging.info(f"[SQUAREOFF] SUCCESS {trading_symbol}")
             # ---- TELEGRAM NOTIFICATION ----
             try:
                 msg = (
                     "🚨 <b>SQUARE OFF EXECUTED</b>\n\n"
-                    f"Symbol: {leg.get('TradingSymbol','')}\n"
+                    f"Symbol: {trading_symbol}\n"
                     f"Side: {side}\n"
                     f"Quantity: {qty}\n"
                 )
@@ -226,9 +259,10 @@ class OrderService:
                     res = self.place_single_leg(leg)
                     
                     if res.get("type") == "success":
+                        # XTS → KOTAK NEO REPLACEMENT: Neo uses nOrdNo instead of AppOrderID
                         self.redis_client.hset(self.uid, mapping={
                             "STATUS_SINGLE": "SUCCESS",
-                            "MSG_SINGLE": f"Order Placed: {res.get('result', {}).get('AppOrderID', 'Unknown')}"
+                            "MSG_SINGLE": f"Order Placed: {res.get('result', {}).get('nOrdNo', 'Unknown')}"
                         })
                         send_telegram(
                             f"Order Executed ✔️\n"
@@ -298,7 +332,7 @@ class OrderService:
             self.redis_client.hdel(self.uid, "LEVEL_PE_INDEX")
     
     def place_equity_order(self, order_data):
-        """Place an equity (NSECM) order.
+        """Place an equity (nse_cm) order.
         
         Args:
             order_data: Payload from UI via PLACE_EQUITY
@@ -307,27 +341,34 @@ class OrderService:
         qty = int(order_data["qty"])
         side = order_data["side"].upper()
         product = order_data["product"]
-        exchange_inst_id = order_data["exchangeInstrumentID"]
+        trading_symbol = order_data.get("tradingSymbol") or symbol
         
         logging.info(f"[EXEC-EQUITY] {side} {symbol} Qty={qty} Product={product}")
         
+        # XTS → KOTAK NEO REPLACEMENT: Neo place_order for equity
         try:
-            response = self.xt.place_order(
-                exchangeSegment=self.xt.EXCHANGE_NSECM,
-                exchangeInstrumentID=exchange_inst_id,
-                productType=self.xt.PRODUCT_MIS if product == "MIS" else "CNC",
-                orderType=self.xt.ORDER_TYPE_MARKET,
-                orderSide=self.xt.TRANSACTION_TYPE_BUY if side == "BUY" else self.xt.TRANSACTION_TYPE_SELL,
-                timeInForce=self.xt.VALIDITY_DAY,
-                disclosedQuantity=0,
-                orderQuantity=qty,
-                limitPrice=0,
-                stopPrice=0,
-                orderUniqueIdentifier=f"EQ-{int(time.time()*1000)}",
-                clientID=self.uid
+            response = self.client.place_order(
+                exchange_segment="nse_cm",
+                product=product,  # MIS or CNC
+                price="0",
+                order_type="MKT",
+                quantity=str(qty),
+                validity="DAY",
+                trading_symbol=trading_symbol,
+                transaction_type="B" if side == "BUY" else "S",
+                amo="NO",
+                disclosed_quantity="0",
+                market_protection="0",
+                pf="N",
+                trigger_price="0",
+                tag=f"EQ-{int(time.time()*1000)}"
             )
-            logging.info(f"[XTS Response] {response}")
-            return response
+            logging.info(f"[Neo Response] {response}")
+            
+            if response and not response.get("Error"):
+                return {"type": "success", "result": response}
+            else:
+                return {"type": "error", "description": response.get("Error Message", str(response))}
         except Exception as e:
             logging.error(f"[ERROR] Failed to place equity order: {e}")
             return {"type": "error", "description": str(e)}
@@ -349,21 +390,8 @@ class OrderService:
              logging.info("Race condition detected: failed to claim EQUITY_ORDER (already deleted/claimed).")
              return
              
-        # If we are here, we successfully deleted the key.
-        # But wait, do we have 'raw_order'?
-        # If raw_order was None, hdel would likely be 0 too.
-        # if raw_order was not None, and hdel succeeded, we are good.
-        # Use raw_order.
-        
         if not raw_order:
-            # Edge case: key existed when we hdel'd? No, if it didn't exist hdel is 0.
-            # So if hdel is 1, raw_order *should* be there unless we failed to read it properly?
-            # Or if it was set to empty string?
-            # Let's assume if hdel==1, we "won" the right to process.
-            # But we need the data.
-            # If we acted on "requested" flag, we assume data is there.
             logging.error("Claimed EQUITY_ORDER but payload was empty/None?")
-            # Restore status?
             self.redis_client.hset(self.uid, mapping={"PLACE_EQUITY": "failed_no_payload", "STATUS_EQUITY": "FAILED"})
             return
 
@@ -374,15 +402,15 @@ class OrderService:
             
             # Verify state
             if order_data.get("state") != "requested":
-                 # Technically we claimed it, but state is wrong. Abort.
                  return
             
             # Execute
             res = self.place_equity_order(order_data)
             
             if res.get("type") == "success":
-                app_order_id = res.get('result', {}).get('AppOrderID', 'Unknown')
-                msg = f"SUCCESS: Order Placed {app_order_id}"
+                # XTS → KOTAK NEO REPLACEMENT: Neo uses nOrdNo instead of AppOrderID
+                order_no = res.get('result', {}).get('nOrdNo', 'Unknown')
+                msg = f"SUCCESS: Order Placed {order_no}"
                 self.redis_client.hset(self.uid, mapping={"STATUS_EQUITY": msg})
                 
                 # Notify Telegram
@@ -431,7 +459,7 @@ class OrderService:
             logging.info(f"[OI AUTO] Executing: {leg}")
 
             # ==================================================
-            # 🔴 EXIT-FIRST / POSITION AWARE LOGIC (NEW)
+            # 🔴 EXIT-FIRST / POSITION AWARE LOGIC
             # ==================================================
             live_pos = get_position(index)
 
@@ -463,11 +491,12 @@ class OrderService:
                         f"{exit_leg['Strike']}"
                     )
 
-                    exch_id = self.redis_client.hget("XTS_INSTR", redis_key)
-                    if exch_id is None:
-                        raise ValueError(f"exchangeInstrumentID not found for exit {redis_key}")
+                    # XTS → KOTAK NEO REPLACEMENT: Using NEO_INSTR_OPT instead of XTS_INSTR
+                    trading_sym = self.redis_client.hget("NEO_INSTR_OPT", redis_key)
+                    if trading_sym is None:
+                        raise ValueError(f"tradingSymbol not found for exit {redis_key}")
 
-                    exit_leg["exchangeInstrumentID"] = int(exch_id)
+                    exit_leg["tradingSymbol"] = trading_sym
                     exit_legs.append(exit_leg)
 
                 # Fire EXIT as multi-leg
@@ -493,7 +522,7 @@ class OrderService:
                     time.sleep(0.5)
 
             # ==================================================
-            # 🟢 NORMAL SELL FLOW (UNCHANGED)
+            # 🟢 NORMAL SELL FLOW
             # ==================================================
             redis_key = (
                 f"{leg['Index']}_"
@@ -502,11 +531,12 @@ class OrderService:
                 f"{leg['Strike']}"
             )
 
-            exchange_inst_id = self.redis_client.hget("XTS_INSTR", redis_key)
-            if exchange_inst_id is None:
-                raise ValueError(f"exchangeInstrumentID not found for {redis_key}")
+            # XTS → KOTAK NEO REPLACEMENT: Using NEO_INSTR_OPT instead of XTS_INSTR
+            trading_symbol = self.redis_client.hget("NEO_INSTR_OPT", redis_key)
+            if trading_symbol is None:
+                raise ValueError(f"tradingSymbol not found for {redis_key}")
 
-            leg["exchangeInstrumentID"] = int(exchange_inst_id)
+            leg["tradingSymbol"] = trading_symbol
 
             res = self.place_single_leg(leg)
 
@@ -520,11 +550,12 @@ class OrderService:
                     legs=[leg]
                 )
 
+                # XTS → KOTAK NEO REPLACEMENT: Neo uses nOrdNo instead of AppOrderID
                 self.redis_client.hset(
                     self.uid,
                     mapping={
                         "STATUS_OI_CROSSOVER": "SUCCESS",
-                        "MSG_OI_CROSSOVER": f"Order placed: {res.get('result', {}).get('AppOrderID')}"
+                        "MSG_OI_CROSSOVER": f"Order placed: {res.get('result', {}).get('nOrdNo')}"
                     }
                 )
                 send_telegram(
@@ -578,11 +609,12 @@ class OrderService:
                 f"{leg['Strike']}"
             )
 
-            exchange_inst_id = self.redis_client.hget("XTS_INSTR", redis_key)
-            if exchange_inst_id is None:
-                raise ValueError(f"exchangeInstrumentID not found for {redis_key}")
+            # XTS → KOTAK NEO REPLACEMENT: Using NEO_INSTR_OPT instead of XTS_INSTR
+            trading_symbol = self.redis_client.hget("NEO_INSTR_OPT", redis_key)
+            if trading_symbol is None:
+                raise ValueError(f"tradingSymbol not found for {redis_key}")
 
-            leg["exchangeInstrumentID"] = int(exchange_inst_id)
+            leg["tradingSymbol"] = trading_symbol
 
             res = self.place_single_leg(leg)
 
@@ -590,11 +622,12 @@ class OrderService:
                 # Consume BANKNIFTY signal ONLY on success
                 self.redis_client.hset("BANKNIFTY_OI_SIGNAL", "status", "CONSUMED")
 
+                # XTS → KOTAK NEO REPLACEMENT: Neo uses nOrdNo instead of AppOrderID
                 self.redis_client.hset(
                     self.uid,
                     mapping={
                         "STATUS_BN_OI_CROSSOVER": "SUCCESS",
-                        "MSG_BN_OI_CROSSOVER": f"Order placed: {res.get('result', {}).get('AppOrderID')}"
+                        "MSG_BN_OI_CROSSOVER": f"Order placed: {res.get('result', {}).get('nOrdNo')}"
                     }
                 )
                 send_telegram(
@@ -650,4 +683,3 @@ class OrderService:
         self.process_oi_crossover_order()
         self.process_bn_oi_crossover_order()
         self.process_squareoff()
-

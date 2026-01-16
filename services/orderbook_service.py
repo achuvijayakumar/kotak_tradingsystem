@@ -14,17 +14,18 @@ except ImportError as e:
 class OrderbookService:
     """Handles orderbook fetching and saving."""
     
-    def __init__(self, xt, redis_client, uid, orderbook_file, base_dir):
+    def __init__(self, client, redis_client, uid, orderbook_file, base_dir):
         """Initialize orderbook service.
         
         Args:
-            xt: XTS client instance
+            client: NeoAPI client instance (authenticated)
             redis_client: Redis client instance
             uid: User ID
             orderbook_file: Path to orderbook CSV file
             base_dir: Base directory for the application
         """
-        self.xt = xt
+        # XTS → KOTAK NEO REPLACEMENT: renamed xt to client
+        self.client = client
         self.redis_client = redis_client
         self.uid = uid
         self.orderbook_file = orderbook_file
@@ -45,17 +46,47 @@ class OrderbookService:
         self._fetch_and_save_orderbook()
     
     def _fetch_and_save_orderbook(self):
-        """Fetch orderbook from XTS API and save to CSV."""
-        response = self.xt.get_order_book(clientID=self.uid)
-        logging.info(f"Order Book: {response}")
+        """Fetch orderbook from Neo API and save to CSV."""
+        # SAFETY CHECK: Ensure client is authenticated
+        if self.client is None:
+            logging.error("[FATAL] NeoAPI client is None - cannot fetch orderbook")
+            return
+        
+        # XTS → KOTAK NEO REPLACEMENT: xt.get_order_book() → client.order_report()
+        try:
+            response = self.client.order_report()
+            logging.info(f"Order Book: {json.dumps(response) if isinstance(response, dict) else response}")
+        except Exception as e:
+            logging.error(f"[ORDERBOOK ERROR] Failed to fetch orders: {e}", exc_info=True)
+            return
         
         # Make sure we have a dict
         if isinstance(response, (str, bytes, bytearray)):
             response = json.loads(response)
         
-        if response.get("type") == "success" and "result" in response:
-            orderbook = response["result"]
+        # XTS → KOTAK NEO REPLACEMENT: Neo order_report() returns different structure
+        # Neo response: {"stat": "Ok", "data": [...]}
+        if response and response.get("stat") == "Ok" and "data" in response:
+            orderbook = response.get("data", [])
             df = pd.DataFrame(orderbook)
+            
+            # XTS → KOTAK NEO REPLACEMENT: Map Neo fields to expected column names
+            # Neo fields: nOrdNo, trdSym, optTp, trnsTp, qty, ordSt, avgPrc, ordDtTm, exTm
+            column_mapping = {
+                "nOrdNo": "AppOrderID",
+                "trdSym": "TradingSymbol",
+                "optTp": "OptionType",
+                "trnsTp": "OrderSide",
+                "qty": "OrderQuantity",
+                "ordSt": "OrderStatus",
+                "avgPrc": "OrderAverageTradedPrice",
+                "ordDtTm": "OrderGeneratedDateTime",
+                "exTm": "ExchangeTransactTime",
+            }
+            
+            # Rename columns that exist
+            df = df.rename(columns={k: v for k, v in column_mapping.items() if k in df.columns})
+            
             wanted_cols = [
                 "AppOrderID",
                 "TradingSymbol",
@@ -76,4 +107,4 @@ class OrderbookService:
             if DUCKDB_AVAILABLE:
                 push_orderbook(self.uid, self.base_dir)
         else:
-            logging.warning("OrderBook Request not successful")
+            logging.warning(f"OrderBook Request not successful: {response}")
