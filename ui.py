@@ -211,8 +211,16 @@ if "user" not in st.session_state:
     #st.session_state.user = None
     name = st.text_input("UID", value="")
     if st.button("Save"):
-        st.session_state.user = name
-        st.success(f"Saved: {name}")
+        if name:
+            from core.user_manager import setup_user
+            if setup_user(name):
+                st.session_state.user = name
+                st.success(f"Saved & Initialized: {name}")
+            else:
+                st.error(f"Failed to initialize user: {name}")
+        else:
+            st.error("Please enter a UID")
+
 
         # NEW — Telegram notify UID selection
         #send_telegram(f"👤 <b>UID Selected</b>\nUser: {name}")

@@ -14,5 +14,4 @@ def send_telegram(msg: str, chat_id: int = GROUP_ID):
     except Exception as e:
         logging.error(f"Telegram send failed: {e}")
         return False
-# Test call removed to prevent import side-effects
-# send_telegram("Testing Telegram Notification")
+#send_telegram("Testing Telegram Notification", chat_id="-1005109977089")
